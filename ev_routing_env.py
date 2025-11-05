@@ -15,7 +15,8 @@ from typing import Dict, List, Optional, Tuple, Any
 #   and apply service/discharge durations.
 # - Observation is a fixed-size padded vector composed of global, per-vehicle, per-customer,
 #   and per-station features.
-# - Action masking is provided in info["action_mask"].
+# - Action masking (generic + vehicle-specific) is provided in info["action_mask"].
+# - Safety layer: invalid actions are converted to a 1.0 time-unit WAIT (no huge penalty).
 # - Rewards combine travel/time costs, penalties, vehicle usage, and V2G revenue.
 #
 # This is a self-contained environment ready to plug into Stable-Baselines3 PPO/A2C.
@@ -91,6 +92,7 @@ class EVRoutingEnv(gym.Env):
 
     Masking:
       info['action_mask'] is a dict with boolean arrays for vehicles and targets.
+      Use _compute_action_mask_for_vehicle(veh) for vehicle-specific target feasibility.
     """
 
     metadata = {"render.modes": []}
@@ -214,7 +216,7 @@ class EVRoutingEnv(gym.Env):
         self.v_soc_max: List[float] = [v['soc_max_kwh'] for v in self.veh_spec]
         self.v_cap: List[float] = [v['capacity'] for v in self.veh_spec]
         self.v_idle: List[bool] = [True if self.v_cap[i] > 0 and self.v_soc_max[i] > 0 else False for i in range(self.maxV)]
-        self.v_tau: List[float] = [0.0 for _ in range(self.maxV)]  # time to availability (unused here, kept for extension)
+        self.v_tau: List[float] = [0.0 for _ in range(self.maxV)]  # reserved for extensions
         self.v_used_flag: List[bool] = [False for _ in range(self.maxV)]
 
         # Customers served flags
@@ -236,22 +238,23 @@ class EVRoutingEnv(gym.Env):
     def step(self, action: Dict[str, Any]):
         self.step_count += 1
         reward = 0.0
-        done = False
+        terminated = False
+        truncated = False
         info: Dict[str, Any] = {}
 
         veh = int(action['vehicle'])
         tgt = int(action['target'])
         discharge_frac = float(action.get('discharge_frac', [0.0])[0])
 
-        # Compute feasibility via mask
+        # Vehicle-specific feasibility mask
         mask = self._compute_action_mask_for_vehicle(veh)
         info['action_mask'] = mask
-        if not mask['vehicle'][veh] or not mask['target'][tgt]:
-            # Safety layer: convert invalid action to WAIT instead of huge penalty
+        if (mask is None) or (not mask['vehicle'][veh]) or (not mask['target'][tgt]):
+            # Safety layer: convert invalid action to WAIT (advance small tick)
             self.v_idle[veh] = True
             tick = 1.0
             self.t += tick
-            reward -= self.c_time * tick  # small time penalty
+            reward -= self.c_time * tick
             obs = self._make_obs()
             info.update({
                 'time': self.t,
@@ -261,7 +264,7 @@ class EVRoutingEnv(gym.Env):
                 'total_penalty': self.total_penalty,
                 'safety_override': 'invalid_action->wait'
             })
-            return obs, reward, done, False, info
+            return obs, reward, terminated, truncated, info
 
         # Map target index to node / special
         # customers: 0..maxC-1, stations: maxC..maxC+maxS-1, return: -2, wait: -1
@@ -292,7 +295,7 @@ class EVRoutingEnv(gym.Env):
             self.v_idle[veh] = True
             reward -= self.c_time * tick
         else:
-            # consume energy to move
+            # consume energy to move — guard SoC
             e_cons = dist * self.cons_kwh_per_km
             if self.v_soc[veh] - e_cons < 0.0:
                 # Safety layer: not enough energy -> WAIT (no move)
@@ -308,7 +311,7 @@ class EVRoutingEnv(gym.Env):
                     'total_penalty': self.total_penalty,
                     'safety_override': 'low_soc->wait'
                 })
-                return obs, reward, done, False, info
+                return obs, reward, terminated, truncated, info
 
             # Apply travel
             self.v_soc[veh] -= e_cons
@@ -328,21 +331,21 @@ class EVRoutingEnv(gym.Env):
                 j = cust_idx
                 if not self.c_served[j] and self.cust_demand[j] > 0.0:
                     a, b = self.cust_tw[j]
-                    # Late penalty if beyond time window
-                    if self.t > b and b > a:
+                    # Late penalty if beyond time window (only if window is meaningful)
+                    if (b > a) and (self.t > b):
                         reward -= self.c_late
                         self.total_penalty += self.c_late
                     # Service time
                     st = self.cust_service[j]
                     self.t += st
-                    # Serve (capacity check: if insufficient capacity, count as infeas)
+                    # Serve (capacity check)
                     if self.v_cap[veh] >= self.cust_demand[j]:
                         self.v_cap[veh] -= self.cust_demand[j]
                         self.c_served[j] = True
                     else:
+                        # not enough capacity — penalize lightly and do not serve
                         reward -= self.c_infeas
                         self.total_penalty += self.c_infeas
-                # else: no-op if already served/padded
 
             elif kind == 'station':
                 k = st_idx
@@ -365,7 +368,7 @@ class EVRoutingEnv(gym.Env):
         all_served = all(self.c_served)
         timeout = self.t >= self.horizon_T
         if all_served or timeout:
-            done = True
+            terminated = True
             # Vehicle usage cost
             n_used = sum(1 for f in self.v_used_flag if f)
             reward -= self.c_vehicle * n_used
@@ -382,7 +385,7 @@ class EVRoutingEnv(gym.Env):
             'total_revenue': self.total_revenue,
             'total_penalty': self.total_penalty,
         })
-        return obs, reward, done, False, info
+        return obs, reward, terminated, truncated, info
 
     # ------------------
     # Observation builder
@@ -454,58 +457,51 @@ class EVRoutingEnv(gym.Env):
         return vec
 
     # ----------------
-    # Action mask logic
+    # Generic action mask (vehicle-only strict, target permissive)
     # ----------------
     def _compute_action_mask(self) -> Dict[str, np.ndarray]:
-        """Return masks for vehicles and targets.
-        - vehicle mask: vehicles that are active (non-zero spec) and idle.
-        - target mask: depends on selected vehicle; here we compute a universal mask that
-          does not depend on vehicle (conservative). In practice, RL libs often need the
-          per-action mask at selection time; you can recompute after choosing a vehicle.
+        """Return masks for vehicles and targets (generic/permissive target mask).
+        Vehicle mask: vehicles that are active (non-zero spec) and idle.
+        Target mask: customers not served, all stations, return+wait allowed.
         """
         veh_mask = np.zeros((self.maxV,), dtype=bool)
         for i in range(self.maxV):
             veh_mask[i] = (self.v_cap[i] > 0.0 and self.v_soc_max[i] > 0.0 and self.v_idle[i])
 
-        # Target mask defaults
         tgt_mask = np.zeros((self.maxC + self.maxS + 2,), dtype=bool)
-
-        # Customers selectable if not served and demand > 0
         for j in range(self.maxC):
             selectable = (not self.c_served[j]) and (self.cust_demand[j] > 0.0)
-            # We also require that at least one vehicle has enough SoC to reach from depot->cust
-            # (weak check to avoid expensive per-vehicle computation).
             if selectable:
                 tgt_mask[j] = True
-
-        # Stations always selectable if any exist
         for k in range(self.maxS):
             tgt_mask[self.maxC + k] = True
-
-        # Return and wait always allowed
-        tgt_mask[self.maxC + self.maxS] = True  # return
+        # 'return' allowed generically; vehicle-specific mask will restrict at depot
+        tgt_mask[self.maxC + self.maxS] = True
         tgt_mask[self.maxC + self.maxS + 1] = True  # wait
-
         return {"vehicle": veh_mask, "target": tgt_mask}
 
-    # ------------------
-    # Helper / utilities
-    # ------------------
-    def _compute_action_mask_for_vehicle(self, veh_idx: int) -> Dict[str, np.ndarray]:
+    # ----------------
+    # Vehicle-specific action mask (SoC + capacity + return-at-depot handling)
+    # ----------------
+    def _compute_action_mask_for_vehicle(self, veh_idx: int):
         """Vehicle-specific action mask based on SoC reachability and capacity.
-        Returns a dict with keys 'vehicle' and 'target'.
-        'vehicle' mask equals the generic one; 'target' is computed for veh_idx.
+        Returns {'vehicle': <bool[nV]>, 'target': <bool[nTargets]>}.
+        Never returns None.
         """
-        # Base vehicle mask from generic method
         base = self._compute_action_mask()
-        veh_mask = base['vehicle']
+        veh_mask = base["vehicle"].copy()
         tgt_mask = np.zeros((self.maxC + self.maxS + 2,), dtype=bool)
+
+        # If veh_idx invalid or vehicle not selectable, only allow WAIT
+        if veh_idx < 0 or veh_idx >= self.maxV or not veh_mask[veh_idx]:
+            tgt_mask[self.maxC + self.maxS + 1] = True  # WAIT
+            return {"vehicle": veh_mask, "target": tgt_mask}
 
         node_u = self.v_loc[veh_idx]
         soc = self.v_soc[veh_idx]
         cap = self.v_cap[veh_idx]
 
-        # Customers: require not served, positive demand, enough capacity, and enough SoC to reach
+        # Customers: require not served, demand>0, capacity ok, and SoC to reach
         for j in range(self.maxC):
             if self.cust_demand[j] <= 0.0 or self.c_served[j]:
                 continue
@@ -525,15 +521,20 @@ class EVRoutingEnv(gym.Env):
             if soc - e_cons >= 0.0:
                 tgt_mask[self.maxC + k] = True
 
-        # Return requires SoC to reach depot; wait always allowed
+        # Return requires (i) not already at depot, and (ii) SoC to reach depot
         dist_home = float(self.dist_km[node_u, 0])
         e_home = dist_home * self.cons_kwh_per_km
-        if soc - e_home >= 0.0:
-            tgt_mask[self.maxC + self.maxS] = True
-        tgt_mask[self.maxC + self.maxS + 1] = True
+        if node_u != 0 and (soc - e_home >= 0.0):
+            tgt_mask[self.maxC + self.maxS] = True  # 'return'
+
+        # Wait always allowed
+        tgt_mask[self.maxC + self.maxS + 1] = True  # 'wait'
 
         return {"vehicle": veh_mask, "target": tgt_mask}
 
+    # ------------------
+    # Helper / utilities
+    # ------------------
     def _is_peak_time(self, k: int, t: float) -> bool:
         for (a, b) in self.st_peak[k]:
             if a <= t <= b:
@@ -541,7 +542,7 @@ class EVRoutingEnv(gym.Env):
         return False
 
     def render(self):
-        # Placeholder: you can extend to a matplotlib scatter showing depot, customers, stations, and vehicle positions.
+        # Placeholder: extend with matplotlib if desired.
         pass
 
 
@@ -596,26 +597,25 @@ def make_tiny_instance(seed: int = 0) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    # Quick manual smoke test
+    # Quick manual smoke test that respects vehicle-specific target masks
     inst = make_tiny_instance(1)
     env = EVRoutingEnv(inst)
     obs, info = env.reset()
     print("obs shape:", obs.shape)
     print("mask:", info['action_mask'])
 
-    # Random policy for a few steps
-    for _ in range(10):
+    for _ in range(20):
         veh_mask = env._compute_action_mask()['vehicle']
-        # choose a vehicle, then compute vehicle-specific target mask
-        # (the generic target mask is conservative and not vehicle-specific)
-        tgt_mask = None
-        # sample masked actions
         veh_choices = np.flatnonzero(veh_mask)
         if len(veh_choices) == 0:
+            # no idle vehicles; wait with vehicle 0
             action = {'vehicle': 0, 'target': inst['max_customers'] + inst['max_stations'] + 1, 'discharge_frac': np.array([0.0], dtype=np.float32)}
         else:
             veh = int(np.random.choice(veh_choices))
-            tgt_mask_v = env._compute_action_mask_for_vehicle(veh)['target']
+            mask_v = env._compute_action_mask_for_vehicle(veh)
+            if not mask_v:
+                mask_v = env._compute_action_mask()  # conservative fallback
+            tgt_mask_v = mask_v['target']
             tgt_choices = np.flatnonzero(tgt_mask_v)
             if len(tgt_choices) == 0:
                 action = {'vehicle': veh, 'target': inst['max_customers'] + inst['max_stations'] + 1, 'discharge_frac': np.array([0.0], dtype=np.float32)}
@@ -625,7 +625,8 @@ if __name__ == "__main__":
                     'target': int(np.random.choice(tgt_choices)),
                     'discharge_frac': np.array([np.random.rand()], dtype=np.float32),
                 }
-        obs, reward, done, trunc, info = env.step(action)
-        print(f"t={info['time']:.1f}, r={reward:.2f}, done={done}")
-        if done:
+        obs, reward, terminated, truncated, info = env.step(action)
+        tag = f" [{info.get('safety_override')} ]" if 'safety_override' in info else ""
+        print(f"t={info['time']:.1f}, r={reward:.2f}, term={terminated}, trunc={truncated}{tag}")
+        if terminated or truncated:
             break
